@@ -1,0 +1,12 @@
+Info: Logic utilisation before packing:
+Info: Device utilisation:
+Info:            ICESTORM_LC:    42/ 5280     0%
+Info:           ICESTORM_RAM:     0/   30     0%
+Info:                  SB_IO:    18/   96    18%
+Info:                  SB_GB:     1/    8    12%
+Info:          ICESTORM_DSP:     1/    8    12%
+Info:               SB_WARMBOOT:     0/    1     0%
+Info: Annotating ports with timing budgets for target frequency 100.00 MHz
+Info: Critical path report for clock 'clk' (posedge -> posedge):
+Info: Max frequency for clock 'clk': 132.45 MHz (PASS at 100.00 MHz)
+Info: Program finished normally.

@@ -1,0 +1,50 @@
+|***************************************************************************
+| Illustrative IBIS model for a 3.3 V LVCMOS FPGA output buffer.
+| Hand-written for the fpgaforge physics demo -- representative, not a vendor
+| datasheet part. Currents/parasitics are typical order-of-magnitude values.
+|***************************************************************************
+[IBIS Ver]       4.2
+[File Name]      ice40_lvcmos33.ibs
+[File Rev]       0.1
+[Component]      ICE40_UP5K
+[Manufacturer]   fpgaforge-demo
+
+[Package]
+| variable       typ            min            max
+R_pkg            0.20           0.15           0.30
+L_pkg            3.5nH          3.0nH          4.5nH
+C_pkg            0.6pF          0.5pF          0.8pF
+
+[Model]          LVCMOS33_8mA
+Model_type       I/O
+Vinl             0.8
+Vinh             2.0
+C_comp           4.0pF          3.0pF          5.0pF
+
+[Voltage Range]  3.3            3.0            3.6
+
+[Pulldown]
+|  Voltage      I(typ)        I(min)        I(max)
+   0.0          0.0mA         0.0mA         0.0mA
+   0.5          16.0mA        12.0mA        20.0mA
+   1.0          30.0mA        24.0mA        38.0mA
+   1.65         46.0mA        38.0mA        56.0mA
+   2.5          58.0mA        49.0mA        70.0mA
+   3.3          66.0mA        56.0mA        80.0mA
+
+[Pullup]
+|  Voltage      I(typ)        I(min)        I(max)
+   0.0          0.0mA         0.0mA         0.0mA
+   -0.5         -15.0mA       -11.0mA       -19.0mA
+   -1.0         -28.0mA       -22.0mA       -36.0mA
+   -1.65        -43.0mA       -35.0mA       -53.0mA
+   -2.5         -55.0mA       -46.0mA       -67.0mA
+   -3.3         -62.0mA       -52.0mA       -76.0mA
+
+[Ramp]
+| variable      typ            min            max
+dV/dt_r         1.98/1.20n     1.60/1.50n     2.30/0.95n
+dV/dt_f         1.98/1.10n     1.60/1.40n     2.30/0.90n
+R_load          50
+
+[End]

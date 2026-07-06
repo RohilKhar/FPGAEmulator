@@ -1,0 +1,83 @@
+{
+  "sta_corner": "slow",
+  "package": {
+    "name": "sg48",
+    "lead_inductance_nh": 4.5,
+    "power_pin_inductance_nh": 3.5,
+    "n_power_pins": 4
+  },
+  "nets": [
+    {
+      "name": "led",
+      "ibis": { "file": "ice40_lvcmos33.ibs", "model": "LVCMOS33_8mA" },
+      "load_pf": 12,
+      "trace_z0_ohm": 50,
+      "trace_len_mm": 40,
+      "n_simultaneous": 1
+    },
+    {
+      "name": "uart_tx",
+      "comment": "Z0 + velocity derived from the PCB stackup geometry",
+      "geometry": {
+        "kind": "microstrip",
+        "trace_w_mm": 0.30,
+        "height_mm": 0.17,
+        "thickness_mm": 0.035,
+        "er": 4.3
+      },
+      "load_pf": 8,
+      "trace_len_mm": 90,
+      "vdd": 3.3,
+      "n_simultaneous": 1
+    }
+  ],
+  "crosstalk": [
+    {
+      "victim": "uart_rx",
+      "comment": "coupling ratios k_l/k_c computed from edge spacing, not guessed",
+      "geometry": {
+        "kind": "microstrip",
+        "trace_w_mm": 0.30,
+        "height_mm": 0.17,
+        "er": 4.3,
+        "spacing_mm": 0.20
+      },
+      "vdd": 3.3,
+      "aggressor_rise_ns": 1.2,
+      "coupling_len_mm": 60,
+      "n_aggressors": 2
+    }
+  ],
+  "pdn": {
+    "vdd": 1.2,
+    "ripple_fraction": 0.05,
+    "transient_current_a": 0.5,
+    "mount_inductance_nh": 0.3,
+    "plane_capacitance_nf": 2.0,
+    "caps": [
+      { "capacitance_uf": 10,  "esr_mohm": 20, "esl_nh": 1.2, "count": 1, "label": "bulk" },
+      { "capacitance_uf": 1.0, "esr_mohm": 15, "esl_nh": 0.8, "count": 2, "label": "mid" },
+      { "capacitance_uf": 0.1, "esr_mohm": 30, "esl_nh": 0.5, "count": 4, "label": "hf" }
+    ]
+  },
+  "power": {
+    "resources": { "luts": 1800, "ffs": 1200, "bram": 4, "dsp": 0 },
+    "io_count": 18,
+    "activity": 0.15,
+    "ambient_c": 25.0,
+    "theta_ja_c_per_w": 40.0
+  },
+  "interfaces": [
+    {
+      "name": "uart",
+      "clock_mhz": 1.0,
+      "ddr": false,
+      "tco_max_ns": 6.0,
+      "tco_min_ns": 2.0,
+      "setup_req_ns": 20.0,
+      "hold_req_ns": 20.0,
+      "board_skew_ns": 1.0,
+      "clock_jitter_ns": 2.0
+    }
+  ]
+}

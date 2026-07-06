@@ -1,0 +1,15 @@
+2.49. Printing statistics.
+
+=== mac ===
+
+   Number of wires:                 30
+   Number of wire bits:            180
+   Number of public wires:           6
+   Number of memories:               0
+   Number of memory bits:            0
+   Number of cells:                 89
+     SB_CARRY                       16
+     SB_DFF                         32
+     SB_LUT4                        40
+     SB_MAC16                        1
+

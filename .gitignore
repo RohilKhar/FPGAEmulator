@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+
+# fpgaforge runtime artifacts
+data/corpus.jsonl
+data/model.joblib
+*.asc
+*.bin
+*.json.netlist
+work/
+.runs/
+
+# Tooling
+.pytest_cache/
+.mypy_cache/
+.DS_Store
