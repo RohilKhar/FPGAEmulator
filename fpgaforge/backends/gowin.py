@@ -1,13 +1,14 @@
-"""Ecp5Backend: the open-source Lattice ECP5 flow.
+"""GowinBackend: the open-source Gowin LittleBee flow (Project Apicula).
 
-Pipeline: yosys (synth_ecp5) -> nextpnr-ecp5 (place, route, timing) -> ecppack.
-Mirrors :class:`Ice40Backend` so the whole stack (emulate/verify/prove/physics/
-reward) works on a second, larger architecture -- proving the engine is not
-iCE40-specific. ECP5 brings bigger devices, more BRAM, and hardened DSP, which
-also unblocks memory-heavy designs.
+Pipeline: yosys (synth_gowin) -> nextpnr-himbaechel (Gowin arch; the older
+nextpnr-gowin binary is accepted too) -> gowin_pack (Apicula) -> ``.fs``
+bitstream. Because Apicula also ships ``gowin_unpack``, the flashed bitstream
+can be decoded *back* to a netlist -- lifting Gowin parts to the same
+bit-level equivalence tier as iCE40 (see ``emulator/reconstruct.py``).
 
-Like the iCE40 backend, every step is captured and failures return a RunResult
-with success=False rather than raising.
+Like the other backends, every step is captured and failures return a
+RunResult with success=False rather than raising; ``is_available()`` gates on
+the tools so the platform degrades to MockBackend when they're missing.
 """
 
 from __future__ import annotations
@@ -24,34 +25,38 @@ from .base import Backend, Design, FlowOptions, RunMetrics, RunResult
 
 from ..devices import by_backend
 
-# Device table derived from the central registry (fpgaforge/devices.py).
-# target -> (nextpnr size flag, default package)
+# target -> (apicula device name, default package). From the central registry.
 _DEVICES: dict[str, tuple[str, str]] = {
-    d.target: (d.pnr_flag, d.package) for d in by_backend("ecp5")
+    d.target: (d.part, d.package) for d in by_backend("gowin")
 }
 
 
-class Ecp5Backend(Backend):
-    name = "ecp5"
+def _find_nextpnr() -> str | None:
+    for exe in ("nextpnr-himbaechel", "nextpnr-gowin"):
+        if shutil.which(exe):
+            return exe
+    return None
+
+
+class GowinBackend(Backend):
+    name = "gowin"
 
     def __init__(
         self,
         yosys: str = "yosys",
-        nextpnr: str = "nextpnr-ecp5",
-        ecppack: str = "ecppack",
+        nextpnr: str | None = None,
+        gowin_pack: str = "gowin_pack",
         timeout_s: int = 900,
-        emit_timing_artifacts: bool = False,
     ) -> None:
         self.yosys = yosys
-        self.nextpnr = nextpnr
-        self.ecppack = ecppack
+        self.nextpnr = nextpnr or _find_nextpnr() or "nextpnr-himbaechel"
+        self.gowin_pack = gowin_pack
         self.timeout_s = timeout_s
-        self.emit_timing_artifacts = emit_timing_artifacts
 
     def is_available(self) -> bool:
-        return shutil.which(self.yosys) is not None and (
-            shutil.which(self.nextpnr) is not None
-        )
+        return (shutil.which(self.yosys) is not None
+                and shutil.which(self.nextpnr) is not None
+                and shutil.which(self.gowin_pack) is not None)
 
     def run(self, design: Design, options: FlowOptions, workdir: Path) -> RunResult:
         workdir.mkdir(parents=True, exist_ok=True)
@@ -65,18 +70,16 @@ class Ecp5Backend(Backend):
         )
 
         if design.target not in _DEVICES:
-            result.error = f"unsupported ecp5 target: {design.target}"
+            result.error = f"unsupported gowin target: {design.target}"
             return result
-        size_flag, package = _DEVICES[design.target]
+        device, _package = _DEVICES[design.target]
 
         rtl_files = rtl_transform.prepare_rtl(design, options, workdir)
         netlist_path = workdir / "netlist.json"
-        config_path = workdir / "out.config"
-        bit_path = workdir / "out.bit"
-        sdf_path = workdir / "timing.sdf"
         routed_path = workdir / "routed.json"
+        fs_path = workdir / "out.fs"
 
-        # ---- Synthesis (yosys) ----
+        # ---- Synthesis (yosys synth_gowin) ----
         synth_log, netlist, ok = self._run_yosys(
             rtl_files, design.top, options, netlist_path, workdir
         )
@@ -88,39 +91,35 @@ class Ecp5Backend(Backend):
         result.features = feat.from_yosys_json(netlist, design.top)
         yosys_counts = reports.parse_yosys_stat_text(synth_log)
 
-        # ---- Place & route + timing (nextpnr) ----
+        # ---- Place & route + timing (nextpnr, himbaechel Gowin arch) ----
         pnr_log, _ = self._run_nextpnr(
-            netlist_path, config_path, size_flag, package, design, options, workdir,
-            sdf_path if self.emit_timing_artifacts else None,
-            routed_path if self.emit_timing_artifacts else None,
+            netlist_path, routed_path, device, design, options, workdir
         )
         result.log += "\n" + pnr_log
-        if self.emit_timing_artifacts:
-            if sdf_path.exists():
-                result.sdf_path = str(sdf_path)
-            if routed_path.exists():
-                result.routed_netlist_path = str(routed_path)
         result.metrics = reports.build_metrics(
             nextpnr_log=pnr_log,
             yosys_stat=yosys_counts,
             target_freq_mhz=design.target_freq_mhz,
         )
+        if routed_path.exists():
+            result.routed_netlist_path = str(routed_path)
 
-        if not result.metrics.routed_ok and not config_path.exists():
+        if not result.metrics.routed_ok and not routed_path.exists():
             result.error = "place-and-route failed"
             result.success = False
             return result
 
-        # ---- Bitstream (ecppack, optional) ----
-        if shutil.which(self.ecppack) and config_path.exists():
+        # ---- Bitstream (gowin_pack, Apicula) ----
+        if shutil.which(self.gowin_pack) and routed_path.exists():
             pack_log, pack_ok = self._run_cmd(
-                [self.ecppack, str(config_path), str(bit_path)], workdir
+                [self.gowin_pack, "-d", device, "-o", str(fs_path),
+                 str(routed_path)], workdir
             )
             result.log += "\n" + pack_log
-            if pack_ok and bit_path.exists():
-                result.bitstream_path = str(bit_path)
+            if pack_ok and fs_path.exists():
+                result.bitstream_path = str(fs_path)
 
-        result.success = result.metrics.routed_ok or config_path.exists()
+        result.success = result.metrics.routed_ok or routed_path.exists()
         return result
 
     # ------------------------------------------------------------------ #
@@ -128,14 +127,12 @@ class Ecp5Backend(Backend):
         synth_flags = []
         if options.retime:
             synth_flags.append("-retime")
-        if not options.dsp:
-            synth_flags.append("-nodsp")
         synth_flags_str = " ".join(synth_flags)
 
         read = "\n".join(f"read_verilog {f}" for f in rtl_files)
         script = (
             f"{read}\n"
-            f"synth_ecp5 -top {top} {synth_flags_str} -json {netlist_path}\n"
+            f"synth_gowin -top {top} {synth_flags_str} -json {netlist_path}\n"
             f"stat\n"
         )
         script_path = workdir / "synth.ys"
@@ -150,29 +147,23 @@ class Ecp5Backend(Backend):
                 netlist = None
         return log, netlist, ok and netlist is not None
 
-    def _run_nextpnr(self, netlist_path, config_path, size_flag, package, design,
-                     options, workdir, sdf_path=None, routed_path=None):
+    def _run_nextpnr(self, netlist_path, routed_path, device, design, options,
+                     workdir):
         cmd = [
             self.nextpnr,
-            size_flag,
-            "--package",
-            package,
-            "--json",
-            str(netlist_path),
-            "--textcfg",
-            str(config_path),
-            "--freq",
-            f"{design.target_freq_mhz:.3f}",
-            "--seed",
-            str(options.seed),
-            "--placer",
-            options.placer,
-            "--lpf-allow-unconstrained",
+            "--json", str(netlist_path),
+            "--write", str(routed_path),
+            "--freq", f"{design.target_freq_mhz:.3f}",
+            "--seed", str(options.seed),
         ]
-        if sdf_path is not None:
-            cmd += ["--sdf", str(sdf_path)]
-        if routed_path is not None:
-            cmd += ["--write", str(routed_path)]
+        if "himbaechel" in self.nextpnr:
+            cmd += ["--device", device, "--vopt", f"family={device.split('-')[0]}"]
+        else:  # legacy nextpnr-gowin
+            cmd += ["--device", device]
+        if design.pcf:
+            # Gowin flows use .cst physical constraints; nextpnr-himbaechel
+            # takes them via --vopt cst=
+            cmd += ["--vopt", f"cst={Path(design.pcf).resolve()}"]
         return self._run_cmd(cmd, workdir)
 
     def _run_cmd(self, cmd: list[str], workdir: Path):

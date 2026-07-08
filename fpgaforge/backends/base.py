@@ -29,6 +29,9 @@ class Design:
     target: str = "ice40_up5k"
     clock_ns: float = 10.0  # 100 MHz target by default
     name: str | None = None
+    # Optional pin-constraint file (.pcf for iCE40/nextpnr). When set, place &
+    # route locks I/O to the board's pins instead of auto-placing them.
+    pcf: str | None = None
 
     def __post_init__(self) -> None:
         if isinstance(self.rtl_files, (str, Path)):

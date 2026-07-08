@@ -140,10 +140,22 @@ def signoff(
     rtl_files = [rtl] if isinstance(rtl, str) else list(rtl)
     design = Design(rtl_files=tuple(rtl_files), top=top, target=target_fpga, clock_ns=clock_ns)
     if backend is None:
-        if target_fpga.startswith("ecp5"):
+        from .devices import get as _dev_get
+
+        dev = _dev_get(target_fpga)
+        backend_name = dev.backend if dev is not None else "ice40"
+        if backend_name == "ecp5":
             from .backends.ecp5 import Ecp5Backend
 
             backend = Ecp5Backend(emit_timing_artifacts=True)
+        elif backend_name == "vivado":
+            from .backends.vivado import VivadoBackend
+
+            backend = VivadoBackend(emit_timing_artifacts=True)
+        elif backend_name == "quartus":
+            from .backends.quartus import QuartusBackend
+
+            backend = QuartusBackend(emit_timing_artifacts=True)
         else:
             backend = Ice40Backend(emit_timing_artifacts=True)
 

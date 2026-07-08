@@ -24,14 +24,15 @@ import subprocess
 import sys
 from pathlib import Path
 
+from ..devices import by_backend
 from ..virtual.board import Port
 
-# target -> (icestorm device tag, nextpnr flag, default package)
+# target -> (icestorm device tag, nextpnr flag, default package).
+# Only IceStorm-reconstructable devices belong here; derived from the registry.
 DEVICE_INFO: dict[str, tuple[str, str, str]] = {
-    "ice40_up5k": ("5k", "--up5k", "sg48"),
-    "ice40_hx8k": ("8k", "--hx8k", "ct256"),
-    "ice40_lp8k": ("8k", "--lp8k", "cm81"),
-    "ice40_hx1k": ("1k", "--hx1k", "tq144"),
+    d.target: (d.chipdb_tag, d.pnr_flag, d.package)
+    for d in by_backend("ice40")
+    if d.reconstructor == "icestorm"
 }
 
 

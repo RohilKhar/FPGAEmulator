@@ -497,6 +497,43 @@ memory-heavy design can't be proven to a useful depth in time, falls back to the
 measured `verify` campaign — so the `READY` verdict is always backed by the best
 available bitstream evidence, with the exact rung named in the report.
 
+### Netlist-level proof: RTL ≡ vendor post-implementation netlist
+
+On iCE40 the bitstream is an open format, so `prove` reconstructs the fabric and
+proves RTL ≡ *the actual flashed bits* (AMD 7-series and Gowin reach the same
+tier via Project X-Ray / Apicula when those tools are installed). On locked
+silicon (AMD UltraScale+, all Intel) the bitstream is encrypted/undocumented
+and cannot be reconstructed — but the
+vendor tool emits a **gate-level post-implementation netlist** (Vivado
+`write_verilog -mode funcsim`, Quartus `.vo`) built from documented library
+primitives (`LUT6`, `FDRE`, `CARRY4`, `RAMB36E1`, `DSP48E1`, …). yosys ships
+behavioral models of exactly those primitives, so `prove` can run the *same*
+miter — RTL vs the routed netlist — one rung below the bits:
+
+```python
+from fpgaforge import prove
+
+# RTL vs the netlist your AMD/Intel flow already produced.
+p = prove("cpu.v", top="cpu", target_fpga="xc7a35t",
+          netlist="impl/cpu_funcsim.v")
+print(p.summary())
+# result: the post-implementation netlist is formally equivalent to the design
+#         for ALL inputs and ALL time (unbounded induction)
+```
+
+```bash
+fpgaforge prove cpu.v --top cpu --target xc7a35t --netlist impl/cpu_funcsim.v
+```
+
+This proves synthesis + place & route preserved your semantics through the
+netlist — everything except the final, undocumented bit-packing step. `assess`
+wires it in automatically: for a vendor-locked device whose backend emitted a
+Verilog netlist, the readiness gate runs the netlist-level proof and reports a
+`netlist_equivalence` check; otherwise it names netlist equivalence as the
+strongest achievable tier. The sim library per family lives in the device
+registry (`DeviceInfo.sim_lib`), so the same flow lifts ECP5, 7-series/UltraScale+
+and Cyclone/MAX10 designs to the netlist tier with no vendor tools at prove time.
+
 ### Proven on a real RISC-V CPU (picorv32)
 
 `fpgaforge` handles real, third-party designs — not just toy examples. Pull the
@@ -724,18 +761,138 @@ the real layout remains the gold standard for tight designs, and the PDN model
 is a lumped network — good for choosing decoupling and catching anti-resonance,
 not a plane-cavity resonance solve.
 
-## Backends
+## Pin constraints: the board-level gate
 
-- **`Ice40Backend`** — real open-source flow for the Lattice iCE40 family.
-  - Synthesis: `yosys` (`synth_ice40`)
-  - Place & route + timing: `nextpnr-ice40`
-  - Bitstream: `icepack` (Project IceStorm)
-- **`Ecp5Backend`** — the same stack for the larger Lattice ECP5 family
-  (`synth_ecp5` → `nextpnr-ecp5` → `ecppack`, Project Trellis), proving the
-  engine is not iCE40-specific. Targets `ecp5_12k/25k/45k/85k`; `backend_for_target()`
-  auto-selects by device, falling back to the mock when tools are absent.
-- **`MockBackend`** — deterministic, tool-free backend so the API, model, and tests run
-  fully offline (also used in CI).
+A wrong or missing pin assignment is the classic first-shot killer: the design
+is functionally perfect, the tools auto-place I/O on whatever pins route best,
+and the board is wired to different ones. `fpgaforge` makes the pin map a
+first-class, *checked* input:
+
+```bash
+fpgaforge assess examples/counter.v --top counter \
+    --pins examples/counter_up5k.pcf --board examples/board_spec.json
+```
+
+```
+[ok]  pin_constraints: pin map validated: 10/10 port bits pinned,
+      validated against the package and board spec
+```
+
+The checker parses every supported dialect — `.pcf` (iCE40), `.lpf` (ECP5),
+`.xdc` (AMD/Vivado), `.qsf` (Intel/Quartus) — and validates against three
+levels of ground truth:
+
+1. **The design's real ports** (from the synthesized netlist): every bit of
+   every top-level port must be pinned; no constraints for ports that don't
+   exist; no double-booked pins. A partial bus (`count[0]` pinned, bits 1–7
+   auto-placed) is a hard failure.
+2. **The package**: pins must exist on the device package (checked against the
+   IceStorm chipdb on iCE40) and fit the I/O budget. On iCE40 the `.pcf` is
+   also fed to the *real* place & route, so the proven bitstream is constrained
+   to the board's pins — not auto-placed.
+3. **The board spec** (`--board`): the clock port must be pinned to an actual
+   board clock source (and a too-slow source warns that a PLL is needed), and
+   each I/O standard's voltage must be backed by a real board rail
+   (`LVCMOS33` with no 3.3 V rail is a failure).
+
+`--require-pins` makes a missing pin map a hard `BLOCKED` — recommended for any
+gate that feeds real hardware. Programmatic API: `load_pins()` / `check_pins()`.
+
+## On-FPGA self-test: verifying the silicon itself
+
+Silicon defects, marginal rails, and environment (temperature, clock quality)
+are *physically outside any simulator's reach*. So the platform generates the
+artifact that can check them — a built-in self-test that runs on the real chip:
+
+```bash
+fpgaforge selftest examples/counter.v --top counter --cycles 4096 --build
+```
+
+```
+on-FPGA self-test harness generated
+golden   : 0x81805224d6272233
+coverage : 4096 pseudo-random cycles after 8-cycle reset
+validated: yes -- harness simulation asserts test_pass
+harness bitstream: .runs/selftest/build/out.bin
+```
+
+The harness wraps your design with a maximal-length **LFSR** driving every
+input and a **MISR** compressing every output of every cycle into a 64-bit
+signature, compared against a **golden signature** computed cycle-accurately in
+simulation and baked into the bitstream. On the bench: `test_done` high +
+`test_pass` high means the physical silicon reproduced the simulation
+bit-for-bit; `test_pass` low means a silicon/board-level fault. The generator
+validates its own harness in simulation, is proven to catch modeled defects
+(a stuck output bit drops `test_pass`), and *refuses to generate* when the
+design has non-reset state that would make the predicted signature unsound.
+
+This closes the loop end-to-end: formal proof guarantees the bits implement
+your RTL, and the self-test verifies the chip executes those bits correctly in
+its real electrical environment.
+
+## Backends and multi-vendor support
+
+Every target the platform knows about lives in one **device registry**
+(`fpgaforge/devices.py`) as a `DeviceInfo` — vendor, family, backend, capacities
+(LUT/FF/BRAM/DSP/IO), and, crucially, *which capability tiers it can reach*.
+`backend_for_target()` and every capacity table are derived from it, so adding a
+part is a one-line registry entry.
+
+- **`Ice40Backend`** — open-source Lattice iCE40 flow (`yosys synth_ice40` →
+  `nextpnr-ice40` → `icepack`, Project IceStorm).
+- **`Ecp5Backend`** — open-source Lattice ECP5 flow (`synth_ecp5` →
+  `nextpnr-ecp5` → `ecppack`, Project Trellis). Targets `ecp5_12k/25k/45k/85k`.
+- **`VivadoBackend`** — AMD/Xilinx flow. Drives Vivado in `-mode batch`
+  (`synth_design` → `opt/place/route` → `report_{utilization,timing,power}` →
+  `write_verilog`/`write_sdf`/`write_bitstream`) and parses the reports into the
+  same `RunMetrics`. Targets 7-series/Zynq/UltraScale+ (`xc7a35t`, `xc7z020`,
+  `xczu3eg`, …).
+- **`QuartusBackend`** — Intel/Altera flow (`quartus_map` → `quartus_fit` →
+  `quartus_sta` → `quartus_pow`), parsing the `.rpt` files. Targets Cyclone/MAX 10
+  (`cyclonev_5csema5`, `max10_10m50`, …).
+- **`MockBackend`** — deterministic, tool-free backend so the API, model, and
+  tests run fully offline. `backend_for_target()` falls back to it when a
+  vendor's tools aren't installed.
+
+### Support is *tiered*, honestly
+
+Bit-level bring-up — decoding the *flashed bitstream* back to a fabric and
+proving it ≡ RTL — is only possible where an **open bitstream database** exists.
+Vendor-locked silicon (AMD UltraScale+, all Intel) ships an
+undocumented/encrypted bitstream, so that guarantee is *physically* impossible
+there. Each device therefore advertises the strongest tier it can reach, via a
+pluggable `FabricReconstructor`:
+
+- `IceStormReconstructor` — iCE40 via `icebox_vlog` (always available with the
+  open flow).
+- `XRayReconstructor` — AMD 7-series via **Project X-Ray** (`bit2fasm` +
+  `fasm2bels`, with `PRJXRAY_DB_DIR` pointing at the database checkout). The
+  7-series bitstream is community-documented, so these parts are
+  bit-reconstructable when the tools are installed.
+- `ApiculaReconstructor` — Gowin LittleBee via **Project Apicula**
+  (`gowin_unpack`, `pip install apycula`), one-step bitstream → Verilog decode.
+- `NoReconstruction` — truly locked silicon (UltraScale+, Intel).
+
+| Equivalence tier | What's proven | Devices |
+|---|---|---|
+| **bitstream** | RTL ≡ the actual bitstream you flash | iCE40 (IceStorm), AMD 7-series (X-Ray, tool-gated), Gowin (Apicula, tool-gated) |
+| **netlist** | RTL ≡ vendor post-implementation netlist (formal miter, + vendor timing/power sign-off, measured `verify`) | ECP5, AMD (Vivado), Intel (Quartus), Gowin |
+| **none** | implementation + timing only | (mock) |
+
+The tier is **availability-aware**: `DeviceInfo.equivalence_tier` states what
+the device's bitstream *format* permits, and `achievable_tier()` narrows it to
+what the installed toolchain can do right now — so an xc7 part honestly reports
+the netlist tier until prjxray is installed, with a message naming exactly what
+to install to climb to the bit level.
+
+The **netlist** tier is a real formal proof, not just measured verification:
+`prove(..., netlist=...)` miters the RTL against the routed gate-level netlist
+using yosys' bundled vendor sim libraries (`DeviceInfo.sim_lib`). `assess` runs
+it automatically when a vendor backend emits a Verilog netlist and reports a
+`netlist_equivalence` check. `assess` names the tier per device (e.g. `device :
+ice40_up5k [lattice] - equivalence tier: bit-level`), and `verify`/`prove`
+degrade gracefully with a clear message on vendor parts instead of pretending to
+do the impossible.
 
 ## Install
 
@@ -799,6 +956,13 @@ fpgaforge timing-emulate examples/counter.v --top counter --clock-mhz 100
 
 # Validate the verifier itself: inject bitstream faults, report the kill rate
 fpgaforge mutation-test examples/counter.v --top counter --mutants 12
+
+# Board-level gate: validate the pin map against ports, package, and board
+fpgaforge assess examples/counter.v --top counter \
+    --pins examples/counter_up5k.pcf --board examples/board_spec.json --require-pins
+
+# Generate + build an on-FPGA self-test (BIST) that verifies the silicon itself
+fpgaforge selftest examples/counter.v --top counter --cycles 4096 --build
 ```
 
 Add `--mock` to any command to force the offline `MockBackend`.
@@ -818,7 +982,12 @@ Add `--mock` to any command to force the offline `MockBackend`.
 
 `fpgaforge` is intentionally a thin but complete vertical slice. Each seam grows independently:
 
-- **More targets**: ECP5 (`nextpnr-ecp5`), then vendor adapters (Vivado / Quartus).
+- **More targets**: iCE40 + ECP5 + Gowin (open source) and AMD/Intel via the
+  Vivado / Quartus vendor backends are in; the netlist-level equivalence prover
+  miters RTL against the vendor post-impl netlist (`prove --netlist`), and
+  bitstream reconstruction is pluggable across IceStorm, Project X-Ray (AMD
+  7-series) and Project Apicula (Gowin) — install the decoding tools and those
+  parts lift to the bitstream tier automatically.
 - **Better models**: richer netlist/graph features, per-path timing prediction.
 - **Real RTL transforms**: automatic pipelining, high-fanout replication, arithmetic
   rebalancing, memory rewriting for better BRAM inference.

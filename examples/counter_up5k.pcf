@@ -1,0 +1,11 @@
+# iCE40UP5K sg48 pin map for examples/counter.v (edit to match your board)
+set_io clk 35
+set_io rst 10
+set_io count[0] 11
+set_io count[1] 12
+set_io count[2] 13
+set_io count[3] 14
+set_io count[4] 15
+set_io count[5] 16
+set_io count[6] 17
+set_io count[7] 18

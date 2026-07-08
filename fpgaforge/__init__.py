@@ -17,6 +17,12 @@ from .backends.base import (
 )
 from .backends.ice40 import Ice40Backend
 from .backends.ecp5 import Ecp5Backend
+from .backends.vivado import VivadoBackend
+from .backends.quartus import QuartusBackend
+from .backends.gowin import GowinBackend
+from .pins import PinConstraints, PinReport, check_pins, load_pins
+from .selftest import SelfTestReport, generate_selftest
+from .devices import DeviceInfo, get as get_device, all_devices, targets as device_targets
 from .backends.mock import MockBackend
 from .emulator import (
     BoardConfig,
@@ -96,7 +102,20 @@ __all__ = [
     "RunResult",
     "Ice40Backend",
     "Ecp5Backend",
+    "VivadoBackend",
+    "QuartusBackend",
+    "GowinBackend",
+    "PinConstraints",
+    "PinReport",
+    "check_pins",
+    "load_pins",
+    "SelfTestReport",
+    "generate_selftest",
     "MockBackend",
+    "DeviceInfo",
+    "get_device",
+    "all_devices",
+    "device_targets",
     "OptimizationResult",
     "optimize",
     "backend_for_target",

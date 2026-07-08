@@ -76,18 +76,43 @@ class OptimizationResult:
         return "\n".join(lines)
 
 
+def _backend_instance(name: str) -> Backend | None:
+    """Construct a backend by its registry name, or None if we don't ship it."""
+    if name == "ice40":
+        return Ice40Backend()
+    if name == "ecp5":
+        return Ecp5Backend()
+    if name == "vivado":
+        from .backends.vivado import VivadoBackend
+
+        return VivadoBackend()
+    if name == "quartus":
+        from .backends.quartus import QuartusBackend
+
+        return QuartusBackend()
+    if name == "gowin":
+        from .backends.gowin import GowinBackend
+
+        return GowinBackend()
+    return None
+
+
 def backend_for_target(target: str | None = None) -> Backend:
     """Pick the backend matching a device target (falling back to mock).
 
-    ``ecp5_*`` -> Ecp5Backend, otherwise the iCE40 flow. If the matching tools
-    are not installed, the offline MockBackend is returned so callers still get
-    a (mock) result.
+    The device registry (fpgaforge/devices.py) names which backend implements a
+    target -- iCE40/ECP5 (open source), Vivado (AMD), or Quartus (Intel). If the
+    matching tools are not installed, the offline MockBackend is returned so
+    callers still get a (mock) result.
     """
-    if target and target.startswith("ecp5"):
-        b: Backend = Ecp5Backend()
-        return b if b.is_available() else MockBackend()
-    ice = Ice40Backend()
-    return ice if ice.is_available() else MockBackend()
+    from .devices import get as _dev_get
+
+    dev = _dev_get(target)
+    name = dev.backend if dev is not None else "ice40"
+    b = _backend_instance(name)
+    if b is not None and b.is_available():
+        return b
+    return MockBackend()
 
 
 def default_backend(target: str | None = None) -> Backend:
@@ -149,6 +174,7 @@ def optimize(
     corpus: Corpus | None = None,
     run_dir: str | Path = ".runs",
     seeds: Sequence[int] = (1, 2, 3),
+    pcf: str | Path | None = None,
 ) -> OptimizationResult:
     """Optimize a design's implementation toward `objective`.
 
@@ -169,7 +195,8 @@ def optimize(
 
     rtl_files = [rtl] if isinstance(rtl, str) else list(rtl)
     design = Design(
-        rtl_files=tuple(rtl_files), top=top, target=target_fpga, clock_ns=clock_ns
+        rtl_files=tuple(rtl_files), top=top, target=target_fpga, clock_ns=clock_ns,
+        pcf=str(pcf) if pcf else None,
     )
     if backend is None:
         backend = default_backend(design.target)

@@ -24,27 +24,11 @@ BLOCKED = "BLOCKED"
 _STATUS_RANK = {"pass": 0, "warn": 1, "fail": 2}
 
 # Approximate usable logic-cell and bonded-I/O counts per default package.
-DEVICE_LUT_CAPACITY = {
-    "ice40_up5k": 5280,
-    "ice40_hx8k": 7680,
-    "ice40_hx1k": 1280,
-    "ice40_lp8k": 7680,
-    # ECP5: usable LUT4s (~ logic cells) per device.
-    "ecp5_12k": 12288,
-    "ecp5_25k": 24288,
-    "ecp5_45k": 44000,
-    "ecp5_85k": 83640,
-}
-DEVICE_IO_CAPACITY = {
-    "ice40_up5k": 39,   # sg48 is a 48-pin package
-    "ice40_hx8k": 206,  # ct256
-    "ice40_hx1k": 96,   # tq144
-    "ice40_lp8k": 63,   # cm81
-    "ecp5_12k": 197,    # CABGA256
-    "ecp5_25k": 197,    # CABGA256
-    "ecp5_45k": 285,    # CABGA381
-    "ecp5_85k": 285,    # CABGA381
-}
+from .devices import all_devices as _all_devices
+
+# Capacity tables derived from the central device registry (fpgaforge/devices.py).
+DEVICE_LUT_CAPACITY = {d.target: d.luts for d in _all_devices()}
+DEVICE_IO_CAPACITY = {d.target: d.io for d in _all_devices()}
 
 # Reset-like names excluded from clock-domain counting.
 _RESET_TOKENS = {"rst", "reset", "rst_n", "resetn", "nrst", "rstn", "reset_n", "arst", "arst_n"}
@@ -75,6 +59,9 @@ class ReadinessReport:
     simulated: bool = False   # True if run against the mock backend (no real tools)
     fmax_mhz: float = 0.0
     target_mhz: float = 0.0
+    target_device: str = ""
+    vendor: str = ""
+    equivalence_tier: str = ""   # "bitstream" | "netlist" | "none" (see devices.py)
     bitstream_path: str | None = None
     diagnostics: list[str] = field(default_factory=list)   # real tool errors
     tool_warnings: list[str] = field(default_factory=list)  # real tool warnings
@@ -97,6 +84,14 @@ class ReadinessReport:
             headline,
             f"design : {self.design_id}",
         ]
+        if self.target_device:
+            tier = {
+                "bitstream": "bit-level (proves the flashed bitstream)",
+                "netlist": "netlist-level (proves the post-impl netlist)",
+                "none": "none (no formal equivalence path on this silicon)",
+            }.get(self.equivalence_tier, self.equivalence_tier)
+            vend = f" [{self.vendor}]" if self.vendor else ""
+            lines.append(f"device : {self.target_device}{vend} - equivalence tier: {tier}")
         if self.fmax_mhz or self.target_mhz:
             lines.append(
                 f"timing : {self.fmax_mhz:.1f} MHz achieved vs {self.target_mhz:.1f} MHz target"
@@ -157,6 +152,9 @@ def evaluate(
     rtl_text: str = "",
     bitstream_equivalence: str = "skipped",  # see _equivalence_check
     equivalence_detail: str = "",
+    equivalence_tier_used: str = "bitstream",  # "bitstream" | "netlist"
+    pin_status: str = "skipped",   # "valid" | "invalid" | "missing" | "skipped"
+    pin_detail: str = "",
     cdc_report=None,          # optional cdc.CDCReport for structural CDC analysis
 ) -> list[Check]:
     """Build the full list of readiness checks from run facts. Pure."""
@@ -327,33 +325,60 @@ def evaluate(
 
     # 9. Bitstream equivalence (the strongest evidence: does the flashed image
     # actually implement the RTL?).
-    eq = _equivalence_check(bitstream_equivalence, equivalence_detail)
+    eq = _equivalence_check(bitstream_equivalence, equivalence_detail,
+                            tier=equivalence_tier_used)
     if eq is not None:
         checks.append(eq)
+
+    # 10. Pin constraints (board-level reality: a wrong/missing pin map is the
+    # classic first-shot killer no functional check can catch).
+    if pin_status == "valid":
+        checks.append(Check("pin_constraints", "pass",
+                            f"pin map validated: {pin_detail}".rstrip(": ")))
+    elif pin_status == "invalid":
+        checks.append(Check(
+            "pin_constraints", "fail",
+            f"pin constraints are wrong: {pin_detail}",
+            "Fix the pin map before flashing -- a wrong pin assignment is the "
+            "#1 cause of first-shot bench failures."))
+    elif pin_status == "missing":
+        checks.append(Check(
+            "pin_constraints", "fail",
+            "no pin-constraint file provided; I/O will be auto-placed on pins "
+            "your board is not wired to",
+            "Write a .pcf/.xdc/.qsf/.lpf mapping every top-level port to the "
+            "board's pins and pass it via --pins."))
+    # "skipped" -> the user did not engage pin checking; emit nothing.
 
     return checks
 
 
-def _equivalence_check(status: str, detail: str) -> Check | None:
-    """Turn a bitstream-equivalence outcome into a readiness check."""
+def _equivalence_check(status: str, detail: str, tier: str = "bitstream") -> Check | None:
+    """Turn an equivalence outcome into a readiness check.
+
+    ``tier`` is ``"bitstream"`` (RTL == flashed bits, open silicon) or
+    ``"netlist"`` (RTL == vendor post-impl netlist, vendor-locked silicon).
+    """
+    name = "netlist_equivalence" if tier == "netlist" else "bitstream_equivalence"
+    subject = "post-implementation netlist" if tier == "netlist" else "flashed bitstream"
     if status == "proved_all":
-        return Check("bitstream_equivalence", "pass",
-                     "flashed bitstream formally equivalent to RTL (all inputs, all time)")
+        return Check(name, "pass",
+                     f"{subject} formally equivalent to RTL (all inputs, all time)")
     if status == "proved_bounded":
-        return Check("bitstream_equivalence", "pass",
-                     f"flashed bitstream formally equivalent to RTL {detail}".rstrip())
+        return Check(name, "pass",
+                     f"{subject} formally equivalent to RTL {detail}".rstrip())
     if status == "verified":
-        return Check("bitstream_equivalence", "pass",
-                     f"flashed bitstream matches RTL {detail}".rstrip())
+        return Check(name, "pass",
+                     f"{subject} matches RTL {detail}".rstrip())
     if status == "differ":
-        return Check("bitstream_equivalence", "fail",
-                     f"flashed bitstream differs from RTL: {detail}",
+        return Check(name, "fail",
+                     f"{subject} differs from RTL: {detail}",
                      "Toolchain miscompiled the design; do not flash. Report the "
                      "counterexample.")
     if status == "inconclusive":
-        return Check("bitstream_equivalence", "warn",
-                     "bitstream equivalence not established (proof inconclusive)",
-                     "Design likely too large/memory-heavy for the SAT prover; rely "
+        return Check(name, "warn",
+                     f"{tier} equivalence not established (proof inconclusive)",
+                     "Design likely too large/memory-heavy for the prover; rely "
                      "on cycle-accurate verify and extend its coverage.")
     return None  # skipped -> omit the check entirely
 
@@ -415,6 +440,112 @@ def _run_equivalence(rtl_files, top, target_fpga, clock_ns, cycles, rtl_hash):
     return "verified", detail, v.bitstream_path, float(v.confidence)
 
 
+def _run_netlist_equivalence(rtl_files, top, target_fpga, netlist_path, clock_ns,
+                             cycles, rtl_hash):
+    """Prove RTL == a vendor post-implementation netlist (netlist tier).
+
+    Used for vendor-locked silicon whose bitstream cannot be reconstructed but
+    whose backend emitted a gate-level Verilog netlist. Returns the same
+    ``(status, detail, artifact, confidence)`` shape as ``_run_equivalence``.
+    """
+    from .backends.base import Design
+    from .emulator import Emulator
+
+    clock_mhz = 1000.0 / clock_ns if clock_ns > 0 else 50.0
+    eng = Emulator()
+    design = Design(rtl_files=tuple(rtl_files), top=top, target=target_fpga)
+    try:
+        p = eng.prove_equivalence(
+            design, clock_mhz=clock_mhz, depth=min(max(cycles, 8), 24),
+            unbounded=True, netlist=netlist_path,
+            workdir=Path(".runs") / "assess_prove_nl" / rtl_hash,
+        )
+    except Exception as exc:  # noqa: BLE001 - never let this break the gate
+        return "inconclusive", str(exc), None, None
+
+    if p.equivalent is True:
+        if p.unbounded:
+            return "proved_all", "against the post-implementation netlist", str(netlist_path), 1.0
+        return ("proved_bounded",
+                f"against the post-impl netlist over {p.depth} cycles from reset",
+                str(netlist_path), 1.0)
+    if p.equivalent is False:
+        return "differ", p.counterexample or "RTL and netlist differ", str(netlist_path), 0.0
+    return "inconclusive", p.error or "", str(netlist_path), None
+
+
+def _run_pin_check(pins, run, top, dev, board_file, clock_ns):
+    """Validate pin constraints against the design's real ports/package/board.
+
+    Returns ``(status, detail)`` where status is one of ``"valid"``,
+    ``"invalid"``, ``"missing"``, ``"skipped"``.
+    """
+    if pins is None:
+        return "missing", ""
+
+    from .pins import check_pins, load_pins
+
+    try:
+        pc = load_pins(pins)
+    except Exception as exc:  # noqa: BLE001 - report, don't crash the gate
+        return "invalid", f"could not parse {pins}: {exc}"
+
+    # Real top-level ports come from the synthesized netlist.
+    ports = None
+    if run and run.workdir:
+        nl_file = Path(run.workdir) / "netlist.json"
+        if nl_file.exists():
+            try:
+                import json as _json
+
+                from .virtual.vfpga import _ports_from_netlist
+
+                ports = _ports_from_netlist(_json.loads(nl_file.read_text()), top)
+            except Exception:  # noqa: BLE001
+                ports = None
+    if not ports:
+        return "skipped", "could not extract top-level ports to validate pins"
+
+    # Package pin database (iCE40 via the IceStorm chipdb, when installed).
+    valid_pins = None
+    if dev is not None and dev.chipdb_tag:
+        try:
+            from .emulator import netlist as _nl
+
+            chipdb = _nl.find_chipdb(dev.chipdb_tag)
+            if chipdb is not None:
+                valid_pins = set(_nl.parse_package_pins(chipdb, dev.package))
+        except Exception:  # noqa: BLE001
+            valid_pins = None
+
+    board = None
+    if board_file is not None:
+        try:
+            import json as _json
+
+            board = _json.loads(Path(board_file).read_text())
+        except Exception as exc:  # noqa: BLE001
+            return "invalid", f"could not parse board spec {board_file}: {exc}"
+
+    from .virtual.board import detect_clock
+
+    clock_port = detect_clock(ports, None)
+    rep = check_pins(
+        pc, ports, valid_pins=valid_pins,
+        io_capacity=dev.io if dev else None,
+        board=board, clock_port=clock_port.name if clock_port else None,
+        clock_ns=clock_ns,
+    )
+    if not rep.ok:
+        return "invalid", "; ".join(rep.errors[:4])
+    detail = (f"{rep.constrained_ports}/{rep.total_port_bits} port bits pinned, "
+              f"validated against the package"
+              + (" and board spec" if board else ""))
+    if rep.warnings:
+        detail += "; " + "; ".join(rep.warnings[:2])
+    return "valid", detail
+
+
 def score_and_verdict(checks: list[Check]) -> tuple[int, str]:
     fails = sum(1 for c in checks if c.status == "fail")
     warns = sum(1 for c in checks if c.status == "warn")
@@ -441,6 +572,9 @@ def assess(
     testbench: str | Path | None = None,
     prove_equivalence: bool = True,
     sdc: str | Path | None = None,
+    pins: str | Path | None = None,
+    require_pins: bool = False,
+    board_file: str | Path | None = None,
     backend=None,
 ) -> ReadinessReport:
     """Assess whether a design can reach the FPGA first shot.
@@ -451,13 +585,21 @@ def assess(
     to cycle-accurate verify), then fuses them into a verdict + confidence +
     fixes. Pass ``sdc`` to honor real timing constraints (multiple clocks,
     false/multicycle paths).
+
+    Pass ``pins`` (a .pcf/.xdc/.qsf/.lpf file) to validate the board pin map
+    against the design's real ports and package -- and, on iCE40, to constrain
+    the actual place & route to those pins. ``require_pins=True`` makes a
+    missing pin map a hard failure. ``board_file`` additionally cross-checks
+    the clock source and voltage rails from a board spec JSON.
     """
     from .backends.base import Design, FlowOptions
     from .optimizer import default_backend, optimize as run_optimize
     from .virtual.vfpga import VirtualFPGA, bringup as run_bringup
 
     rtl_files = [rtl] if isinstance(rtl, str) else list(rtl)
-    design = Design(rtl_files=tuple(rtl_files), top=top, target=target_fpga, clock_ns=clock_ns)
+    pcf = str(pins) if pins is not None and str(pins).endswith(".pcf") else None
+    design = Design(rtl_files=tuple(rtl_files), top=top, target=target_fpga,
+                    clock_ns=clock_ns, pcf=pcf)
 
     if backend is None:
         backend = default_backend(target_fpga)
@@ -468,7 +610,7 @@ def assess(
         opt = run_optimize(
             rtl=rtl_files, top=top, target_fpga=target_fpga,
             objective="maximize_fmax", iterations=iterations,
-            clock_ns=clock_ns, backend=backend,
+            clock_ns=clock_ns, backend=backend, pcf=pcf,
         )
         run = opt.best
     else:
@@ -497,11 +639,21 @@ def assess(
     equivalence_detail = ""
     equivalence_bitstream: str | None = None
     equivalence_confidence: float | None = None
+    equivalence_tier_used = "bitstream"
+    from .devices import get as _dev_get
+    from .emulator.reconstruct import achievable_tier, reconstructor_for
+
+    dev = _dev_get(target_fpga)
+    # Bit-level bring-up needs the device format to be open AND the decoding
+    # tools installed (IceStorm / Project X-Ray / Apicula).
+    recon = reconstructor_for(target_fpga)
+    reconstructable = bool(dev and dev.reconstructable and recon.available)
     if (
         prove_equivalence
         and not simulated
         and metrics is not None
         and metrics.routed_ok
+        and reconstructable
         and target_fpga in DEVICE_IO_CAPACITY
         and 0 < io_count <= DEVICE_IO_CAPACITY[target_fpga]
     ):
@@ -509,6 +661,31 @@ def assess(
          equivalence_confidence) = _run_equivalence(
             rtl_files, top, target_fpga, clock_ns, cycles, design.rtl_hash()
         )
+    elif prove_equivalence and not simulated and dev is not None and not reconstructable:
+        # Vendor-locked silicon: bit-level bring-up is impossible; the strongest
+        # tier is netlist-level equivalence. If the backend emitted a gate-level
+        # Verilog netlist and we know the vendor sim library, prove RTL == it.
+        nl = getattr(run, "routed_netlist_path", None) if run else None
+        nl_ok = (
+            nl is not None and dev.sim_lib
+            and str(nl).lower().endswith((".v", ".vo", ".vg"))
+            and Path(nl).exists()
+        )
+        if nl_ok:
+            equivalence_tier_used = "netlist"
+            (equivalence_status, equivalence_detail, equivalence_bitstream,
+             equivalence_confidence) = _run_netlist_equivalence(
+                rtl_files, top, target_fpga, nl, clock_ns, cycles, design.rtl_hash()
+            )
+        else:
+            equivalence_status = "skipped"
+            equivalence_detail = recon.why_unavailable(target_fpga)
+
+    # ---- Pin constraints (board-level: right pins, clock source, rails) ----
+    pin_status, pin_detail = "skipped", ""
+    if pins is not None or require_pins:
+        pin_status, pin_detail = _run_pin_check(
+            pins, run, top, dev, board_file, clock_ns)
 
     # ---- Structural CDC analysis on the synthesized netlist ----
     cdc_report = None
@@ -548,6 +725,9 @@ def assess(
         rtl_text=rtl_text,
         bitstream_equivalence=equivalence_status,
         equivalence_detail=equivalence_detail,
+        equivalence_tier_used=equivalence_tier_used,
+        pin_status=pin_status,
+        pin_detail=pin_detail,
         cdc_report=cdc_report,
     )
     score, verdict = score_and_verdict(checks)
@@ -638,6 +818,9 @@ def assess(
         simulated=simulated,
         fmax_mhz=float(metrics.fmax_mhz) if metrics else 0.0,
         target_mhz=design.target_freq_mhz,
+        target_device=target_fpga,
+        vendor=dev.vendor if dev else "",
+        equivalence_tier=achievable_tier(dev),
         bitstream_path=run.bitstream_path if run else None,
         diagnostics=diag_errors,
         tool_warnings=diag_warnings[:10],

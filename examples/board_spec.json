@@ -1,5 +1,12 @@
 {
   "sta_corner": "slow",
+  "clock_sources": [
+    { "pin": "35", "mhz": 12.0, "name": "12 MHz crystal oscillator" }
+  ],
+  "rails": [
+    { "volts": 3.3, "name": "VCCIO (bank 3.3 V)" },
+    { "volts": 1.2, "name": "VCC core" }
+  ],
   "package": {
     "name": "sg48",
     "lead_inductance_nh": 4.5,

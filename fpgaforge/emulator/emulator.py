@@ -81,6 +81,7 @@ class ProofResult:
     depth: int = 0                   # cycles proven (bounded) or induction length
     method: str = ""                 # "induction" | "bmc" | ""
     engine: str = "sat"              # "sat" (bit-blasting) | "smt" (memory arrays)
+    against: str = "bitstream"       # "bitstream" (flashed bits) | "netlist" (post-impl)
     counterexample: str | None = None
     bitstream_path: str | None = None
     fabric: "FabricConfig | None" = None
@@ -93,12 +94,14 @@ class ProofResult:
         return self.equivalent is True
 
     def summary(self) -> str:
+        subject = ("flashed bitstream" if self.against == "bitstream"
+                   else "post-implementation netlist")
         if self.equivalent is True:
             scope = ("for ALL inputs and ALL time (unbounded induction)"
                      if self.unbounded
                      else f"for ALL inputs over {self.depth} cycles from reset (BMC)")
             verdict = "PROVEN EQUIVALENT"
-            tail = (f"result    : the flashed bitstream is formally equivalent to the "
+            tail = (f"result    : the {subject} is formally equivalent to the "
                     f"design {scope}")
         elif self.equivalent is False:
             verdict = "NOT EQUIVALENT"
@@ -330,7 +333,12 @@ class Emulator:
 
         Returns ``(_Artifacts, error_or_None, log)``. Shared by verify and prove.
         """
+        from .reconstruct import reconstructor_for
+
         log_all = ""
+        recon = reconstructor_for(design.target, icebox_vlog=self.icebox_vlog)
+        if not recon.available:
+            return None, recon.why_unavailable(design.target), log_all
         if design.target not in nl.DEVICE_INFO:
             return None, f"unsupported target for emulation: {design.target}", log_all
         device_tag, device_flag, package = nl.DEVICE_INFO[design.target]
@@ -396,8 +404,7 @@ class Emulator:
 
         recon_v = workdir / "recon.v"
         try:
-            nl.reconstruct(rt_asc, recon_v, pcf_path=pcf_path, module="recon",
-                           icebox_vlog=self.icebox_vlog)
+            recon.reconstruct(rt_asc, recon_v, pcf_path=pcf_path, module="recon")
         except RuntimeError as exc:
             return None, f"reconstruction failed: {exc}", log_all
         wrapper_v = workdir / "recon_top.v"
@@ -626,8 +633,14 @@ class Emulator:
         config: BringUpConfig | None = None,
         workdir: str | Path = ".runs/prove",
         strategy: str = "auto",
+        netlist: str | Path | None = None,
     ) -> ProofResult:
-        """Formally prove RTL == bitstream.
+        """Formally prove RTL == bitstream (or == a post-impl netlist).
+
+        When ``netlist`` is given (a gate-level Verilog netlist, e.g. from
+        Vivado ``write_verilog -mode funcsim`` or Quartus ``.vo``), this proves
+        RTL == that netlist instead -- the netlist-level equivalence tier used
+        for vendor-locked devices whose bitstream cannot be reconstructed.
 
         ``strategy`` selects the proof engine:
           * ``sat``  -- bit-blasting SAT miter (temporal induction + BMC). Fast
@@ -638,6 +651,12 @@ class Emulator:
           * ``auto`` -- SMT when the design has memory and the SMT tools exist,
             otherwise SAT.
         """
+        if netlist is not None:
+            return self.prove_netlist_equivalence(
+                design, netlist, clock_mhz=clock_mhz, depth=depth,
+                unbounded=unbounded, strategy=strategy, workdir=workdir,
+            )
+
         cfg = config or BringUpConfig()
         workdir = Path(workdir).resolve()
         workdir.mkdir(parents=True, exist_ok=True)
@@ -704,11 +723,23 @@ class Emulator:
 
     # ------------------------------------------------------------------ #
     def _prove_sat(self, res, design, art, depth, unbounded, workdir) -> ProofResult:
-        # Try an unbounded proof by temporal induction first; if it does not
-        # converge, fall back to a bounded (BMC) proof to `depth` cycles.
+        return self._solve_sat(
+            res, lambda mode: self._equiv_script(design.top, art, mode=mode, depth=depth),
+            depth, unbounded, workdir,
+        )
+
+    def _prove_smt(self, res, design, art, depth, workdir) -> ProofResult:
+        return self._solve_smt(
+            res, lambda smt2: self._smt_equiv_script(design.top, art, smt2),
+            depth, workdir,
+        )
+
+    # ---- engine cores, shared by bitstream- and netlist-level proofs ---- #
+    def _solve_sat(self, res, make_script, depth, unbounded, workdir) -> ProofResult:
+        """SAT miter: temporal induction (all-time) then BMC to ``depth``."""
         if unbounded:
-            script = self._equiv_script(design.top, art, mode="induct", depth=depth)
-            outcome, plog = self._run_yosys_script(script, workdir, "prove_induct.ys")
+            outcome, plog = self._run_yosys_script(
+                make_script("induct"), workdir, "prove_induct.ys")
             res.log += "\n" + plog
             if outcome == "proved":
                 res.equivalent, res.unbounded, res.method = True, True, "induction"
@@ -719,8 +750,8 @@ class Emulator:
                 return res
             # inconclusive -> fall through to BMC
 
-        script = self._equiv_script(design.top, art, mode="bmc", depth=depth)
-        outcome, plog = self._run_yosys_script(script, workdir, "prove_bmc.ys")
+        outcome, plog = self._run_yosys_script(
+            make_script("bmc"), workdir, "prove_bmc.ys")
         res.log += "\n" + plog
         if outcome == "proved":
             res.equivalent, res.unbounded, res.method = True, False, "bmc"
@@ -734,7 +765,7 @@ class Emulator:
                              "SAT solver cannot resolve -- try strategy='smt')")
         return res
 
-    def _prove_smt(self, res, design, art, depth, workdir) -> ProofResult:
+    def _solve_smt(self, res, make_smt_script, depth, workdir) -> ProofResult:
         """BMC equivalence with memories modeled as SMT arrays (scales to memory)."""
         if not self._smt_available():
             res.equivalent, res.method = None, "smt"
@@ -742,7 +773,7 @@ class Emulator:
                          "on PATH")
             return res
         smt2 = workdir / "miter.smt2"
-        script = self._smt_equiv_script(design.top, art, smt2)
+        script = make_smt_script(smt2)
         ok, ylog = self._run([self.vfpga.yosys, "-q",
                               str(self._write(workdir, "prove_smt.ys", script))], workdir)
         res.log += "\n" + ylog
@@ -755,7 +786,6 @@ class Emulator:
         res.log += "\n" + slog
         res.method = "bmc"
         if outcome == "proved":
-            # Bounded proof from a zero-initialized state over `depth` cycles.
             res.equivalent, res.unbounded = True, False
         elif outcome == "counterexample":
             res.equivalent = False
@@ -835,6 +865,111 @@ class Emulator:
             f"miter -equiv -flatten -make_assert gold gate miter\n"
             f"hierarchy -top miter\n"
             f"{sat}\n"
+        )
+
+    # ------------------------------------------------------------------ #
+    #  Netlist-level equivalence: prove RTL == vendor post-implementation
+    #  netlist. This is the strongest guarantee available on vendor-locked
+    #  silicon (AMD/Intel) whose bitstream cannot be reconstructed. The gate
+    #  side is the gate-level netlist (e.g. Vivado `write_verilog -mode funcsim`
+    #  or Quartus `.vo`), elaborated with yosys' bundled vendor cells_sim.
+    # ------------------------------------------------------------------ #
+    def prove_netlist_equivalence(
+        self,
+        design: Design,
+        netlist: str | Path,
+        clock_mhz: float = 50.0,
+        depth: int = 20,
+        unbounded: bool = True,
+        strategy: str = "auto",
+        sim_lib: str | None = None,
+        workdir: str | Path = ".runs/prove_netlist",
+    ) -> ProofResult:
+        """Formally prove the RTL is equivalent to a gate-level netlist."""
+        from .. import devices as _devices
+
+        workdir = Path(workdir).resolve()
+        workdir.mkdir(parents=True, exist_ok=True)
+        res = ProofResult(design_id=design.design_id(), depth=depth,
+                          workdir=str(workdir), against="netlist")
+        netlist = Path(netlist).resolve()
+        if not netlist.exists():
+            res.error = f"netlist not found: {netlist}"
+            return res
+        if shutil.which(self.vfpga.yosys) is None:
+            res.error = "netlist-level proof requires yosys on PATH"
+            return res
+        if sim_lib is None:
+            dev = _devices.get(design.target)
+            sim_lib = dev.sim_lib if dev else ""
+        if not sim_lib:
+            res.error = (
+                f"no yosys cell library known for {design.target!r}; pass "
+                f"sim_lib= with the vendor primitives (e.g. '+/xilinx/cells_sim.v')"
+            )
+            return res
+
+        engine = self._select_engine(strategy, design, art=None)
+        res.engine = engine
+        if engine == "smt":
+            return self._solve_smt(
+                res,
+                lambda smt2: self._netlist_smt_script(design, netlist, sim_lib, smt2),
+                depth, workdir,
+            )
+        return self._solve_sat(
+            res,
+            lambda mode: self._netlist_equiv_script(design, netlist, sim_lib, mode, depth),
+            depth, unbounded, workdir,
+        )
+
+    def _netlist_equiv_script(self, design, netlist, sim_lib, mode, depth) -> str:
+        gold = " ".join(str(Path(f).resolve()) for f in design.rtl_files)
+        netlist = Path(netlist).resolve()
+        top = design.top
+        if mode == "induct":
+            sat = f"sat -verify -prove-asserts -tempinduct -set-init-zero -seq {depth} miter"
+        else:
+            sat = f"sat -verify -prove-asserts -seq {depth} -set-init-zero miter"
+        return (
+            f"read_verilog {gold}\n"
+            f"hierarchy -top {top}\n"
+            f"prep -flatten -top {top}\n"
+            f"design -stash gold\n"
+            f"read_verilog {sim_lib}\n"
+            f"read_verilog {netlist}\n"
+            f"hierarchy -top {top}\n"
+            f"prep -flatten -top {top}\n"
+            f"design -stash gate\n"
+            f"design -copy-from gold -as gold {top}\n"
+            f"design -copy-from gate -as gate {top}\n"
+            f"miter -equiv -flatten -make_assert gold gate miter\n"
+            f"hierarchy -top miter\n"
+            f"{sat}\n"
+        )
+
+    def _netlist_smt_script(self, design, netlist, sim_lib, smt2) -> str:
+        gold = " ".join(str(Path(f).resolve()) for f in design.rtl_files)
+        netlist = Path(netlist).resolve()
+        top = design.top
+        return (
+            f"read_verilog {gold}\n"
+            f"hierarchy -top {top}\n"
+            f"prep -flatten -top {top}\n"
+            f"design -stash gold\n"
+            f"read_verilog {sim_lib}\n"
+            f"read_verilog {netlist}\n"
+            f"hierarchy -top {top}\n"
+            f"prep -flatten -top {top}\n"
+            f"design -stash gate\n"
+            f"design -copy-from gold -as gold {top}\n"
+            f"design -copy-from gate -as gate {top}\n"
+            f"miter -equiv -flatten -make_assert gold gate miter\n"
+            f"hierarchy -top miter\n"
+            f"memory_collect\n"
+            f"setundef -params -zero\n"
+            f"setundef -zero -init\n"
+            f"write_smt2 -wires {smt2}\n"
         )
 
     def _run_yosys_script(self, script: str, workdir: Path, name: str):
@@ -1297,6 +1432,7 @@ def prove(
     reset: str | None = None,
     workdir: str | Path = ".runs/prove",
     strategy: str = "auto",
+    netlist: str | Path | None = None,
     engine: Emulator | None = None,
 ) -> ProofResult:
     """Formally prove the flashed bitstream is equivalent to the RTL.
@@ -1314,4 +1450,4 @@ def prove(
     engine = engine or Emulator()
     return engine.prove_equivalence(design, clock_mhz=clock_mhz, depth=depth,
                                     unbounded=unbounded, config=cfg, workdir=workdir,
-                                    strategy=strategy)
+                                    strategy=strategy, netlist=netlist)

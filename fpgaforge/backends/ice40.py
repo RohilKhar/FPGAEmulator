@@ -17,18 +17,20 @@ from .. import reports
 from .. import rtl_transform
 from .base import Backend, Design, FlowOptions, RunMetrics, RunResult
 
-# device target -> (nextpnr device flag, default package)
+from ..devices import by_backend
+
+# Device tables are derived from the central registry (fpgaforge/devices.py).
+# target -> (nextpnr device flag, default package)
 _DEVICES: dict[str, tuple[str, str]] = {
-    "ice40_up5k": ("--up5k", "sg48"),
-    "ice40_hx8k": ("--hx8k", "ct256"),
-    "ice40_hx1k": ("--hx1k", "tq144"),
-    "ice40_lp8k": ("--lp8k", "cm81"),
+    d.target: (d.pnr_flag, d.package) for d in by_backend("ice40")
 }
 
 # Only the UltraPlus family has hardened DSP (SB_MAC16) blocks. On other
 # families a "-dsp" mapping produces cells nextpnr cannot place, so the DSP
 # knob is silently ignored there.
-_DSP_TARGETS: frozenset[str] = frozenset({"ice40_up5k"})
+_DSP_TARGETS: frozenset[str] = frozenset(
+    d.target for d in by_backend("ice40") if d.has_dsp
+)
 
 
 class Ice40Backend(Backend):
@@ -200,6 +202,8 @@ class Ice40Backend(Backend):
             options.placer,
             "--pcf-allow-unconstrained",
         ]
+        if design.pcf:
+            cmd += ["--pcf", str(Path(design.pcf).resolve())]
         if sdf_path is not None:
             cmd += ["--sdf", str(sdf_path)]
         if routed_path is not None:

@@ -382,6 +382,11 @@ def prove(
         "memories as arrays (scales to memory designs); 'auto' picks smt for "
         "memory designs when yosys-smtbmc + a solver are installed."
     ),
+    netlist: Optional[Path] = typer.Option(
+        None, "--netlist", help="Prove RTL == this gate-level netlist (e.g. Vivado "
+        "'write_verilog -mode funcsim' or Quartus .vo) instead of a bitstream. "
+        "Netlist-level tier for vendor-locked devices (AMD/Intel)."
+    ),
     workdir: Path = typer.Option(
         Path(".runs/prove"), "--workdir", help="Where to write artifacts."
     ),
@@ -392,6 +397,10 @@ def prove(
     miter proof. The SAT engine bit-blasts (fast for logic, explodes on memory);
     the SMT engine keeps memories as arrays so memory-heavy designs stay
     tractable. Stronger than `verify`, which only checks one stimulus sequence.
+
+    With --netlist, proves RTL == the given post-implementation netlist instead
+    (netlist-level equivalence), the strongest tier on vendor-locked silicon
+    whose bitstream cannot be reconstructed.
     """
     result = run_prove(
         rtl=rtl,
@@ -404,6 +413,7 @@ def prove(
         reset=reset,
         workdir=workdir,
         strategy=strategy,
+        netlist=netlist,
     )
     typer.echo(result.summary())
     if result.equivalent is False:
@@ -595,6 +605,19 @@ def assess(
     testbench: Optional[Path] = typer.Option(
         None, "--testbench", help="Custom bring-up testbench with self-checks."
     ),
+    pins: Optional[Path] = typer.Option(
+        None, "--pins", help="Pin-constraint file (.pcf/.xdc/.qsf/.lpf). Validated "
+        "against the design's ports, the package, and (with --board) the board "
+        "spec; a .pcf also constrains the real place & route."
+    ),
+    require_pins: bool = typer.Option(
+        False, "--require-pins", help="Fail the gate when no pin map is provided "
+        "(auto-placed I/O is the classic first-shot killer)."
+    ),
+    board: Optional[Path] = typer.Option(
+        None, "--board", help="Board spec JSON: cross-check clock sources and "
+        "voltage rails against the pin map."
+    ),
     mock: bool = typer.Option(False, "--mock", help="Force the offline MockBackend."),
 ) -> None:
     """First-pass readiness gate: can this design reach the FPGA on the first shot?"""
@@ -608,11 +631,60 @@ def assess(
         optimize=not no_optimize,
         testbench=testbench,
         prove_equivalence=not no_prove,
+        pins=pins,
+        require_pins=require_pins,
+        board_file=board,
         backend=(MockBackend() if mock else None),
     )
     typer.echo(report.summary())
     if report.verdict == "BLOCKED":
         raise typer.Exit(code=1)
+
+
+@app.command()
+def selftest(
+    rtl: List[str] = typer.Argument(..., help="RTL file(s)."),
+    top: str = typer.Option(..., "--top", "-t", help="Top module name."),
+    cycles: int = typer.Option(2048, "--cycles", help="Pseudo-random test cycles."),
+    warmup: int = typer.Option(8, "--warmup", help="Reset cycles before capture."),
+    target: str = typer.Option("ice40_up5k", "--target", help="Device target for --build."),
+    build: bool = typer.Option(
+        False, "--build", help="Also build the harness to a bitstream for --target."
+    ),
+    workdir: Path = typer.Option(
+        Path(".runs/selftest"), "--workdir", help="Where to write artifacts."
+    ),
+) -> None:
+    """Generate an on-FPGA self-test (BIST) harness with a golden signature.
+
+    Wraps the design with an LFSR stimulus generator and a MISR signature
+    register, computes the expected signature by cycle-accurate simulation, and
+    bakes it into the harness. Flash it on real hardware: test_pass high means
+    the physical silicon matched the simulation bit-for-bit -- catching
+    defects, rail, clock, and thermal problems no simulator can see.
+    """
+    from .selftest import generate_selftest
+
+    report = generate_selftest(rtl, top, cycles=cycles, warmup=warmup,
+                               workdir=workdir)
+    typer.echo(report.summary())
+    if report.error:
+        raise typer.Exit(code=1)
+    if build:
+        from .optimizer import backend_for_target
+        from .backends.base import FlowOptions
+
+        be = backend_for_target(target)
+        design = Design(
+            rtl_files=tuple(list(rtl) + [report.harness_path]),
+            top=report.harness_top, target=target,
+        )
+        run = be.run(design, FlowOptions(), Path(workdir) / "build")
+        if run.success and run.bitstream_path:
+            typer.echo(f"harness bitstream: {run.bitstream_path}")
+        else:
+            typer.echo(f"harness build failed: {run.error}")
+            raise typer.Exit(code=1)
 
 
 @app.command(name="mutation-test")
